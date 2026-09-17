@@ -19,6 +19,10 @@
 #     --orig-core  fixed stimulus driving the ORIGINAL model, to show that
 #                  fixing the stimulus alone is not enough: the model's
 #                  always-block still drops SEL changes
+#     --race       the real failure, against the FIXED model (both orderings
+#                  settle at 0.870 V)
+#     --race-orig  the real failure, against the ORIGINAL model: identical
+#                  benches diverge to 0.870 V and 0.000 V on a t=0 race
 #     --dump       write a VCD
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -32,6 +36,8 @@ for arg in "$@"; do
   case "$arg" in
     --orig)      MODE=orig ;;
     --orig-core) MODE=orig-core ;;
+    --race)      MODE=race ;;
+    --race-orig) MODE=race-orig ;;
     --dump)      PLUSARGS+=("+dump") ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
@@ -56,6 +62,20 @@ case "$MODE" in
           "${ROOT}/tb/tb_REG_VDDPIX_CORE.sv" )
     TOP=tb_REG_VDDPIX_CORE
     echo "=== ORIGINAL model + FIXED stimulus -- expect dropped SEL changes ==="
+    ;;
+  race)
+    SRC=( "${ROOT}/rtl/REG_VDDPIX_CORE.sv" \
+          "${ROOT}/orig/stim_REG_VDDPIX_TOP.orig.sv" \
+          "${ROOT}/tb/tb_REG_VDDPIX_race.sv" )
+    TOP=tb_REG_VDDPIX_race
+    echo "=== t=0 race bench + FIXED model -- expect both orderings at 0.870 V ==="
+    ;;
+  race-orig)
+    SRC=( "${ROOT}/orig/REG_VDDPIX_CORE.orig.sv" \
+          "${ROOT}/orig/stim_REG_VDDPIX_TOP.orig.sv" \
+          "${ROOT}/tb/tb_REG_VDDPIX_race.sv" )
+    TOP=tb_REG_VDDPIX_race
+    echo "=== t=0 race bench + ORIGINAL model -- expect 0.870 V vs 0.000 V ==="
     ;;
   *)
     SRC=( "${ROOT}/rtl/REG_VDDPIX_CORE.sv" \

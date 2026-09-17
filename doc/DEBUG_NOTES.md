@@ -2,92 +2,94 @@
 
 ## Short answer
 
-The stimulus drove every analog pin as a 1-bit `logic` and powered the block up
-with `'b1`. On an analog net `'b1` is **1.0**, so the model saw AVDD = 1.0 V,
-both grounds = 1.0 V, IBIAS = 1.0 A and VREF = 1.0 V. Every range check in
-`REG_VDDPIX_CORE` failed, `s_enable_global` was never asserted, and the model
-correctly held VDDPIX at 0 V for the whole run.
+`REG_VDDPIX_CORE` drives its output from a single `always` block that contains a
+**blocking delay**:
 
-The model was doing its job. The testbench never powered the block up.
-
-Reproduce it:
-
-```
-sim/run_iverilog.sh --orig
-```
-
-```
-  t(us)  AVDD  AVDD1V1  AVSS  AVSSREF   IBIAS      VREF   en_pwr en_ref en_glob  VDDPIX
-  ------------------------------------------------------------------------------------
-    1.0  0.00   2.50   0.00   0.00   0.00e+00  0.00      0      0      0      0.000
-    2.0  1.00   2.50   1.00   1.00   1.00e+00  1.00      0      0      0      0.000
-    3.0  1.00   2.50   1.00   1.00   1.00e+00  1.00      0      0      0      0.000
-   ...
-  419.0  1.00   2.50   1.00   1.00   1.00e+00  1.00      0      0      0      0.000
+```systemverilog
+always @(s_enable_global, REGVDDPIX_SEL_AVDD, REGVDDPIX_DISABLE_PULLDOWN_AVDD)
+  begin
+    if (s_enable_global) begin
+      #(POR_VDDPIX_ASSERT);
+      ...
+    else begin
+      if (REGVDDPIX_DISABLE_PULLDOWN_AVDD == 0) #(POR_VDDPIX_ASSERT);   //  10 us
+      else                                      #(POR_VDDPIX_RELEASE);  // 355 us
+      s_vddpix = 0.0;
+    end
 ```
 
-`en_pwr` and `en_ref` are `0` on every single line.
+At t=0 the block is triggered while the regulator is still off. If
+`REGVDDPIX_DISABLE_PULLDOWN_AVDD` reads anything other than a hard `0` at that
+instant - `x` is the usual case, since `x == 0` evaluates to `x` and an `if`
+treats that as false - it takes the **355 us** branch.
+
+Verilog does not queue events for an `always` block while that block is
+executing. So for the next 355 us the process is deaf:
+
+| time    | event                                | seen? |
+|---------|--------------------------------------|-------|
+| 2 us    | `s_enable_global` 0 -> 1             | lost  |
+| 2 us    | `DISABLE_PULLDOWN` 0 -> 1            | lost  |
+| 4-19 us | all 16 `REGVDDPIX_SEL` changes       | lost  |
+| 355 us  | wakes up, assigns `s_vddpix = 0.0`   | -     |
+
+It re-arms at 355 us, but the last stimulus change was at **19 us**. Nothing
+ever triggers it again, so VDDPIX sits at 0 V for the whole run - with every
+analog check high and `s_enable_global` high since 2 us.
+
+That is exactly the waveform: all checks high, all `s_enable_*` high, output
+flat at zero.
+
+### It is a race, which is why it looks non-deterministic
+
+Whether the block sees `DISABLE_PULLDOWN` as `0` or as `x` at t=0 is a race
+between the model's continuous assignments and the stimulus `initial` block,
+both of which run at time 0. Different simulators - and sometimes the same
+simulator with a different compile - resolve it differently.
+
+`tb/tb_REG_VDDPIX_race.sv` instantiates the model twice against one bench,
+differing only in that one signal's value at t=0:
+
+```
+sim/run_iverilog.sh --race-orig      # the original model
+```
+
+```
+  analog checks at t=0:  en_pwr=1  en_ref=1  en_chk=1  en_glob=0
+  s_enable_global 0 -> 1 at 2000000 (= 2 us)
+
+   dut_a  DISABLE_PULLDOWN reads 0 at t=0 -> VDDPIX = 0.870 V
+   dut_b  DISABLE_PULLDOWN reads x at t=0 -> VDDPIX = 0.000 V
+***FAIL  the two orderings disagree -- the model has a t=0 race.
+```
+
+Same stimulus, same checks, same enable - 0.870 V or 0.000 V depending purely on
+a time-0 ordering. After the fix:
+
+```
+sim/run_iverilog.sh --race           # the fixed model
+```
+
+```
+   dut_a  DISABLE_PULLDOWN reads 0 at t=0 -> VDDPIX = 0.870 V
+   dut_b  DISABLE_PULLDOWN reads x at t=0 -> VDDPIX = 0.870 V
+   PASS  both orderings settle at 0.870 V -- no t=0 race
+```
+
+### Quick confirmation on your side
+
+Put a `$display` at the top of that `always` block printing `$time`,
+`s_enable_global` and `REGVDDPIX_DISABLE_PULLDOWN_AVDD`. If you see a single
+entry at t=0 followed by nothing until 355 us, this is it.
+
+The fix is [Bug 1](#bug-1---the-models-timing-process-drops-events) below.
 
 ---
 
-## Bug 1 - analog pins declared and driven as bits (root cause)
+## Bug 1 - the model's timing process drops events  (root cause)
 
-`REG_VDDPIX_CORE` declares these as `real_net`, i.e. analog nets carrying volts
-and amps:
-
-```systemverilog
-real_net AVSS, AVSS_REF_REGVDDPIX, AVDD, AVDD1V1;
-real_net VREF_REG_VDDPIX_1V1, IBIAS_REGVDDPIX_5U;
-```
-
-The stimulus declared the same pins as `logic` and drove them with `'b1`:
-
-| Pin                  | Spec in the model         | Original stimulus | Result |
-|----------------------|---------------------------|-------------------|--------|
-| `AVDD`               | 2.4 .. 3.7 V              | `'b1` -> 1.0 V    | FAIL   |
-| `AVDD1V1`            | 0.8 .. 1.3 V              | `vana` = 2.5 V    | FAIL   |
-| `AVSS`               | < 0.1 V                   | `'b1` -> 1.0 V    | FAIL   |
-| `AVSS_REF_REGVDDPIX` | < 0.1 V                   | `'b1` -> 1.0 V    | FAIL   |
-| `IBIAS_REGVDDPIX_5U` | 4.5 uA .. 5.5 uA          | `'b1` -> 1.0 A    | FAIL   |
-| `VREF_REG_VDDPIX_1V1`| 1.078 .. 1.122 V          | `'b1` -> 1.0 V    | FAIL   |
-
-Note the two grounds in particular: the "power up" step raised `AVSS` and
-`AVSS_REF_REGVDDPIX` to `'b1`, i.e. it lifted the grounds to 1 V.
-
-### Bug 1b - `vana` and `vdig` swapped
-
-```systemverilog
-REGVDDPIX_SELDRIVE_GO1 = vdig;   // 1.2 assigned to a 4-bit bus -> 4'b0001
-AVDD1V1                = vana;   // 2.5 V on a 0.8 .. 1.3 V rail
-```
-
-`vana` (2.5) belongs on `AVDD`, `vdig` (1.2) on `AVDD1V1` / `DVDD1V1`.
-`SELDRIVE` is a 4-bit control bus and should not receive a voltage at all.
-
-### Bug 1c - `VDDPIX` read back as a bit
-
-```systemverilog
-input logic VDDPIX;
-```
-
-VDDPIX is an analog output. Reading it as `logic` throws the voltage away, which
-is why the failure showed up only as "stays low" rather than as a number. The
-commented-out `chk_bit(1'b1, VDDPIX, ...)` calls would have been meaningless
-against an analog value even once the supplies were right - they are replaced by
-`chk_real()` in the fixed stimulus.
-
-### Bug 1d - port name mismatch
-
-The stimulus drives `VBG_REGVDDPIX_1V1`; the core expects
-`VREF_REG_VDDPIX_1V1`. In the real hierarchy `REG_VDDPIX_TOP` buffers VBG into
-VREF. `REG_VDDPIX_TOP` was not supplied, so `tb/tb_REG_VDDPIX_CORE.sv` ties the
-two together and stands in for the wrapper.
-
----
-
-## Bug 2 - the model's timing process drops events
-
-This one is independent of Bug 1 and survives fixing the stimulus.
+This is the cause of the failure above. It is also independent of the
+stimulus - it survives any amount of fixing on the testbench side.
 
 ```systemverilog
 always @(s_enable_global, REGVDDPIX_SEL_AVDD, REGVDDPIX_DISABLE_PULLDOWN_AVDD)
@@ -103,12 +105,12 @@ Verilog does **not** queue events for an `always` block while that block is
 executing. Anything that changes during the `#(POR_VDDPIX_ASSERT)` window is
 lost outright. Two distinct symptoms follow:
 
-**2a - dropped transitions.** With `POR_VDDPIX_ASSERT` = 10 us and the original
+**1a - dropped transitions.** With `POR_VDDPIX_ASSERT` = 10 us and the original
 1 us SEL step, 9 of every 10 SEL changes were discarded. The enable edge itself
 is discarded whenever it lands inside a window opened by an earlier event - and
 one always opens at t=0, when `s_enable_global` resolves from `x` to `0`.
 
-**2b - the decision is latched, never re-checked.** The block tests
+**1b - the decision is latched, never re-checked.** The block tests
 `s_enable_global`, *then* waits, then assigns unconditionally. If the enable is
 withdrawn during the wait, the output still goes high.
 
@@ -126,7 +128,7 @@ sim/run_iverilog.sh --orig-core
  RESULT: 23 passed, 4 failed
 ```
 
-The last one is 2b: the enable rises and AVDD goes out of spec in the same time
+The last one is 1b: the enable rises and AVDD goes out of spec in the same time
 step, the block commits to the turn-on during the delta where the enable is
 briefly valid, and 10 us later it drives 0.87 V even though the regulator is not
 enabled any more.
@@ -156,6 +158,56 @@ end
 
 `s_vddpix_target` and `s_settle_delay` are plain combinational functions of the
 inputs, so the decision is re-evaluated continuously instead of being latched.
+
+---
+
+## Bug 2 - latent: the stimulus' analog outputs are 1-bit `logic`
+
+**Not the cause of this failure** - in the production bench all analog comes
+from the top testbench and is correct, which is why every check reads high at
+t=0. This is a trap waiting for whoever wires that stimulus up differently.
+
+`stim_REG_VDDPIX_TOP` declares its analog pins as `logic` and powers up with
+`'b1`:
+
+```systemverilog
+output logic AVDD;              // and AVSS, AVSS_REF_REGVDDPIX,
+output logic IBIAS_REGVDDPIX_5U;// VBG_REGVDDPIX_1V1, AVSSPIX, DVDD1V1
+...
+AVSS = 'b1;                     // lifts the ground to 1 V
+IBIAS_REGVDDPIX_5U = 'b1;       // 1.0 A on a 5 uA bias
+```
+
+On an analog net `'b1` is **1.0**. If those outputs ever reach the model, every
+range check fails at once:
+
+| Pin                  | Spec                | `'b1` gives | |
+|----------------------|---------------------|-------------|--------|
+| `AVDD`               | 2.4 .. 3.7 V        | 1.0 V       | fail   |
+| `AVSS`               | < 0.1 V             | 1.0 V       | fail   |
+| `AVSS_REF_REGVDDPIX` | < 0.1 V             | 1.0 V       | fail   |
+| `IBIAS_REGVDDPIX_5U` | 4.5 .. 5.5 uA       | 1.0 A       | fail   |
+| `VREF_REG_VDDPIX_1V1`| 1.078 .. 1.122 V    | 1.0 V       | fail   |
+
+Two more in the same module:
+
+- `AVDD1V1 = vana` (2.5 V) on a 0.8 .. 1.3 V rail, and
+  `REGVDDPIX_SELDRIVE_GO1 = vdig` puts a real on a 4-bit bus. The two constants
+  are swapped: `vana` belongs on `AVDD`, `vdig` on `AVDD1V1` / `DVDD1V1`.
+- `input logic VDDPIX` reads an analog output as a bit, so the commented-out
+  `chk_bit(1'b1, VDDPIX, ...)` calls could never have worked. `chk_real()` in
+  `tb/stim_REG_VDDPIX_TOP.sv` replaces them.
+
+`tb/stim_REG_VDDPIX_TOP.sv` is a cleaned-up version with the same module name
+and port list, so it drops into the same schematic. Use it or don't - it is not
+what was breaking the run.
+
+### Port name mismatch
+
+The stimulus drives `VBG_REGVDDPIX_1V1`; the core expects
+`VREF_REG_VDDPIX_1V1`. In the real hierarchy `REG_VDDPIX_TOP` buffers VBG into
+VREF. `REG_VDDPIX_TOP` was not supplied, so the benches here tie the two
+together and stand in for the wrapper.
 
 ---
 
